@@ -109,7 +109,9 @@ Resources:
   #    to the SAM-generated API (ServerlessRestApi).
   ApiBasePathMapping:
     Type: AWS::ApiGateway::BasePathMapping
-    DependsOn: ApiCustomDomain
+    DependsOn:
+      - ApiCustomDomain
+      - ServerlessRestApiProdStage
     Properties:
       DomainName: apitodo.jaik.me
       RestApiId: !Ref ServerlessRestApi # Auto-created by SAM from the TodoFunction Api events
