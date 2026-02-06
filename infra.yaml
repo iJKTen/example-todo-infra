@@ -223,8 +223,6 @@ Resources:
             install:
               runtime-versions:
                 golang: 1.21
-              commands:
-                - pip install aws-sam-cli
             build:
               commands:
                 - go mod download
@@ -233,7 +231,7 @@ Resources:
             post_build:
               commands:
                 - cp $CODEBUILD_SRC_DIR_InfraArtifact/app.yaml .
-                - sam package --template-file app.yaml --s3-bucket $ARTIFACT_BUCKET --output-template-file packaged.yaml
+                - aws cloudformation package --template-file app.yaml --s3-bucket $ARTIFACT_BUCKET --output-template-file packaged.yaml
           artifacts:
             files:
               - packaged.yaml
