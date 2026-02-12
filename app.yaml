@@ -1,0 +1,136 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Todo API application - Lambda, DynamoDB, and API Gateway
+Transform: AWS::Serverless-2016-10-31
+
+Parameters:
+  Environment:
+    Type: String
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+
+Mappings:
+  EnvDomain:
+    dev:
+      Domain: dev.apitodo.jaik.me
+    staging:
+      Domain: staging.apitodo.jaik.me
+    prod:
+      Domain: apitodo.jaik.me
+
+Resources:
+  DynamoDbTodoTable:
+    # Create a dynamodb table
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "todos-${Environment}"
+      BillingMode: PAY_PER_REQUEST
+      SSESpecification:
+        SSEEnabled: True
+      AttributeDefinitions:
+        - AttributeName: ID
+          AttributeType: S
+      KeySchema:
+        - AttributeName: ID
+          KeyType: HASH
+
+  TodoFunction:
+    #Use SAM (Serverless Application Model) to create AWS::Lambda::Function, AWS::IAM::Role, AWS::IAM::Policy, AWS::ApiGateway::RestApi, AWS::ApiGateway::Resource, AWS::ApiGateway::Method, AWS::ApiGateway::Deployment, AWS::ApiGateway::Stage, AWS::Lambda::Permission
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: out
+      Handler: bootstrap
+      Runtime: provided.al2023
+      Architectures: [arm64]
+      MemorySize: 512
+      Timeout: 10
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref DynamoDbTodoTable
+          ENV: !Ref Environment
+      Events:
+        GetTodos:
+          Type: Api
+          Properties:
+            Path: /todos
+            Method: GET
+        CreateTodo:
+          Type: Api
+          Properties:
+            Path: /todos
+            Method: POST
+        GetTodoById:
+          Type: Api
+          Properties:
+            Path: /todos/{id}
+            Method: GET
+        UpdateTodoById:
+          Type: Api
+          Properties:
+            Path: /todos/{id}
+            Method: PUT
+        DeleteTodoById:
+          Type: Api
+          Properties:
+            Path: /todos/{id}
+            Method: DELETE
+        # OPTIONS endpoints are required for CORS preflight requests.
+        # Browsers send a preflight OPTIONS request before making cross-origin
+        # requests with custom headers, methods like PUT/DELETE, or credentials.
+        OptionsTodos:
+            Type: Api
+            Properties:
+              Path: /todos
+              Method: OPTIONS
+        OptionsTodoById:
+            Type: Api
+            Properties:
+              Path: /todos/{id}
+              Method: OPTIONS
+      # Grant the Lambda function CRUD permissions on the DynamoDB table.
+      # DynamoDBCrudPolicy is a built-in AWS SAM policy template that expands
+      # into IAM permissions for GetItem, PutItem, UpdateItem, DeleteItem, Query, Scan, etc.
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref DynamoDbTodoTable
+
+  # 1. Bring our own domain: Tell API Gateway "I own <env>.apitodo.jaik.me, here's my SSL cert."
+  ApiCustomDomain:
+    Type: AWS::ApiGateway::DomainName
+    Properties:
+      DomainName: !FindInMap [EnvDomain, !Ref Environment, Domain]
+      RegionalCertificateArn: !ImportValue "Projects-CertificateArn"
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+
+  # 2. Set up DNS: Tell Route 53 to point apitodo.jaik.me to the API Gateway endpoint.
+  ApiDnsRecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !ImportValue "Todo-HostedZoneId"
+      Name: !FindInMap [EnvDomain, !Ref Environment, Domain]
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt ApiCustomDomain.RegionalDomainName
+        HostedZoneId: !GetAtt ApiCustomDomain.RegionalHostedZoneId
+
+  # 3. Route the traffic: When requests arrive at apitodo.jaik.me, send them
+  #    to the SAM-generated API (ServerlessRestApi).
+  ApiBasePathMapping:
+    Type: AWS::ApiGateway::BasePathMapping
+    DependsOn:
+      - ApiCustomDomain
+      - ServerlessRestApiProdStage
+    Properties:
+      DomainName: !FindInMap [EnvDomain, !Ref Environment, Domain]
+      RestApiId: !Ref ServerlessRestApi # Auto-created by SAM from the TodoFunction Api events
+      Stage: Prod
+
+Outputs:
+  TodoApiUrl:
+    Description: "Todo API Gateway endpoint URL"
+    Value: !Sub
+      - "https://${Domain}"
+      - Domain: !FindInMap [EnvDomain, !Ref Environment, Domain]

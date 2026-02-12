@@ -1,0 +1,4 @@
+template-file-path: infra.yaml
+parameters:
+  Environment: dev
+  BranchName: dev

@@ -1,0 +1,316 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Infrastructure for todo app
+
+Parameters:
+  Environment:
+    Type: String
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+  BranchName:
+    Type: String
+    Default: main
+  BuildProjectName:
+    # Store the build project name as a parameter to avoid circular dependency between CodeBuildServiceRole and BuildProject
+    Type: String
+    Default: TodoGoBuild
+
+Resources:
+  PipelineArtifactBucket:
+    # Artifact bucket to store "artifacts" between stages
+    Type: 'AWS::S3::Bucket'
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: CleanupOldArtifacts
+            Status: Enabled
+            ExpirationInDays: 7
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 3
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 1
+
+
+  CodeBuildServiceRole:
+    # IAM Role assumed by CodeBuild to write logs to CloudWatch and read/write to the S3 artifact bucket.
+    Type: 'AWS::IAM::Role'
+    Properties:
+      # TRUST POLICY: Defines WHO (the Principal) can assume this role.
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: 'sts:AssumeRole'
+      # PERMISSIONS POLICY: Defines WHAT actions this role is allowed to perform
+      # once it has been assumed.
+      Policies:
+        - PolicyName: CodeBuildAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                # The * at the end allows CodeBuild to create log streams dynamically for every new build run.
+                # The CloudWatch log group where CodeBuild writes build logs
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/${BuildProjectName}-${Environment}*'
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:GetBucketVersioning
+                Resource: 
+                  - !Sub '${PipelineArtifactBucket.Arn}/*' # Give access to the files inside the bucket.
+                  - !GetAtt PipelineArtifactBucket.Arn # Give access to the bucket itself.
+
+  CodePipelineServiceRole:
+    # IAM Role assumed by CodePipeline to access S3, GitHub, CodeBuild, and CloudFormation
+    Type: 'AWS::IAM::Role'
+    Properties:
+      # TRUST POLICY: Defines WHO (the Principal) can assume this role.
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codepipeline.amazonaws.com
+            Action: 'sts:AssumeRole'
+      # PERMISSIONS POLICY: Defines WHAT actions this role is allowed to perform
+      # once it has been assumed.
+      Policies:
+        - PolicyName: PipelineAccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:GetBucketVersioning
+                  - s3:PutObject
+                  - s3:ListBucket
+                  - s3:DeleteObject
+                Resource:
+                  - !Sub '${PipelineArtifactBucket.Arn}/*' # Give access to the files inside the bucket.
+                  - !GetAtt PipelineArtifactBucket.Arn # Give access to the bucket itself.
+              - Effect: Allow
+                Action: 'codestar-connections:UseConnection'
+                Resource: !ImportValue "GlobalResourcesStack-GitHubConnectionArn"
+              - Effect: Allow
+                Action:
+                  - 'codebuild:BatchGetBuilds'
+                  - 'codebuild:StartBuild'
+                Resource: !GetAtt BuildProject.Arn
+              - Effect: Allow
+                # CodePipeline triggers CloudFormation to create/update the app stack. These permissions let CodePipeline manage CloudFormation stacks during the deploy stage.
+                Action:
+                  - cloudformation:CreateStack
+                  - cloudformation:UpdateStack
+                  - cloudformation:DeleteStack
+                  - cloudformation:DescribeStacks
+                  - cloudformation:DescribeStackEvents
+                  - cloudformation:DescribeStackResource
+                  - cloudformation:GetTemplate
+                  - cloudformation:ValidateTemplate
+                Resource: !Sub 'arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/todo-api-*/*'
+              - Effect: Allow
+                Action:
+                  - iam:PassRole
+                Resource: !GetAtt CloudFormationDeployRole.Arn
+
+  CloudFormationDeployRole:
+    # IAM Role assumed by CloudFormation to create the Lambda, API Gateway, DynamoDB table, and IAM roles
+    Type: 'AWS::IAM::Role'
+    Properties:
+      # TRUST POLICY: Defines WHO (the Principal) can assume this role.
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudformation.amazonaws.com
+            Action: 'sts:AssumeRole'
+      # PERMISSIONS POLICY: Defines WHAT actions this role is allowed to perform
+      # once it has been assumed.
+      Policies:
+        - PolicyName: CloudFormationDeployPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - route53:ChangeResourceRecordSets
+                  - route53:GetHostedZone
+                  - route53:GetChange
+                Resource: !Sub 'arn:aws:route53:::hostedzone/*'
+              - Effect: Allow
+                Action:
+                  - route53:GetChange
+                Resource: 'arn:aws:route53:::change/*'
+              - Effect: Allow
+                Action:
+                  - lambda:*
+                Resource: !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:*'
+              - Effect: Allow
+                Action:
+                  - apigateway:*
+                Resource: !Sub 'arn:aws:apigateway:${AWS::Region}::/*'
+              - Effect: Allow
+                Action:
+                  - dynamodb:CreateTable
+                  - dynamodb:DeleteTable
+                  - dynamodb:DescribeTable
+                  - dynamodb:UpdateTable
+                Resource: !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/todos-*'
+              - Effect: Allow
+                Action:
+                  - iam:CreateRole
+                  - iam:DeleteRole
+                  - iam:GetRole
+                  - iam:PutRolePolicy
+                  - iam:DeleteRolePolicy
+                  - iam:AttachRolePolicy
+                  - iam:DetachRolePolicy
+                  - iam:PassRole
+                  - iam:GetRolePolicy
+                  - iam:TagRole
+                  - iam:UntagRole
+                Resource: !Sub 'arn:aws:iam::${AWS::AccountId}:role/todo-api-*'
+              - Effect: Allow
+                Action:
+                  - iam:CreateServiceLinkedRole
+                Resource: !Sub 'arn:aws:iam::${AWS::AccountId}:role/aws-service-role/ops.apigateway.amazonaws.com/*'
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource: !Sub '${PipelineArtifactBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - cloudformation:CreateChangeSet
+                Resource: !Sub 'arn:aws:cloudformation:${AWS::Region}:aws:transform/Serverless-2016-10-31'
+
+  BuildProject:
+    # CodeBuild project to compile the Go binary and package the SAM template
+    Type: 'AWS::CodeBuild::Project'
+    Properties:
+      Name: !Sub '${BuildProjectName}-${Environment}' # Parameter created at the top of the file
+      ServiceRole: !GetAtt CodeBuildServiceRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:5.0
+        EnvironmentVariables:
+          - Name: ARTIFACT_BUCKET
+            Value: !Ref PipelineArtifactBucket
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: |
+          version: 0.2
+          phases:
+            install:
+              runtime-versions:
+                golang: 1.21
+            build:
+              commands:
+                - go mod download
+                - mkdir -p out
+                - GOOS=linux GOARCH=arm64 go build -o out/bootstrap ./cmd/todo-api
+            post_build:
+              commands:
+                - cp $CODEBUILD_SRC_DIR_InfraArtifact/app.yaml .
+                - aws cloudformation package --template-file app.yaml --s3-bucket $ARTIFACT_BUCKET --output-template-file packaged.yaml
+          artifacts:
+            files:
+              - packaged.yaml
+
+  TodogoGoPipeline:
+    Type: 'AWS::CodePipeline::Pipeline'
+    Properties:
+      RoleArn: !GetAtt CodePipelineServiceRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location: !Ref PipelineArtifactBucket
+      Stages:
+        - Name: Source
+          Actions:
+            # Get the Go API code from GitHub
+            - Name: GitHubSource
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: CodeStarSourceConnection
+                Version: '1'
+              OutputArtifacts:
+                - Name: SourceArtifact
+              Configuration:
+                ConnectionArn: !ImportValue "GlobalResourcesStack-GitHubConnectionArn"
+                FullRepositoryId: iJKTen/example-todo-api
+                BranchName: !Ref BranchName
+                OutputArtifactFormat: CODE_ZIP
+            # Get the infra template from the infra repo
+            - Name: InfraSource
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: CodeStarSourceConnection
+                Version: '1'
+              OutputArtifacts:
+                - Name: InfraArtifact
+              Configuration:
+                ConnectionArn: !ImportValue "GlobalResourcesStack-GitHubConnectionArn"
+                FullRepositoryId: iJKTen/example-todo-infra
+                BranchName: !Ref BranchName
+                OutputArtifactFormat: CODE_ZIP
+        - Name: Build
+          # Get the zipped code from the source artifact, unzip it, and build it using BuildProject and upload it again to the artifact bucket
+          Actions:
+            - Name: GoBuild
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              InputArtifacts:
+                - Name: SourceArtifact
+                - Name: InfraArtifact
+              OutputArtifacts:
+                - Name: BuildArtifact
+              Configuration:
+                ProjectName: !Ref BuildProject
+                PrimarySource: SourceArtifact
+        - Name: Deploy
+          Actions:
+            - Name: CloudFormationDeploy
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CloudFormation # Tell CodePipeline to use CloudFormation
+                Version: '1'
+              InputArtifacts:
+                - Name: BuildArtifact # The build artifact contains packaged.yaml which CloudFormation uses as the deployment template
+              Configuration:
+                ActionMode: CREATE_UPDATE # Create Stack if New, update if stack exists
+                StackName: !Sub "todo-api-${Environment}"
+                TemplatePath: BuildArtifact::packaged.yaml
+                Capabilities: CAPABILITY_IAM,CAPABILITY_AUTO_EXPAND
+                RoleArn: !GetAtt CloudFormationDeployRole.Arn
+                ParameterOverrides: !Sub '{"Environment": "${Environment}"}'
+
